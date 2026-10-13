@@ -1,0 +1,4 @@
+# Optional Codex configuration example. Merge this supported setting manually
+# into ~/.codex/config.toml (or the config.toml under your CODEX_HOME).
+# The setup scripts do not read or modify Codex configuration.
+project_doc_max_bytes = 32768

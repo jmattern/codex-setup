@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""Build a deterministic, self-contained global AGENTS.md."""
+
+from __future__ import annotations
+
+import sys
+
+from instruction_utils import OUTPUT, build_content
+
+
+def main() -> int:
+    content = build_content()
+    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+    OUTPUT.write_bytes(content)
+    print(f"Built {OUTPUT.relative_to(OUTPUT.parents[1])} ({len(content)} bytes)")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, UnicodeError) as error:
+        print(f"build-instructions: {error}", file=sys.stderr)
+        raise SystemExit(1)

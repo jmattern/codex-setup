@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""Preview, install, or safely roll back the generated global instructions."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import sys
+from datetime import datetime, timezone
+
+from instruction_utils import atomic_write, build_content, sha256
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("--codex-home", type=Path, help="Codex home directory (default: CODEX_HOME or ~/.codex)")
+    result.add_argument("--apply", action="store_true", help="write changes; without this flag, only preview")
+    result.add_argument("--replace", action="store_true", help="allow replacing a different existing AGENTS.md")
+    result.add_argument("--rollback", action="store_true", help="undo the latest applied install if the target is unchanged")
+    return result
+
+
+def codex_home(argument: Path | None) -> Path:
+    selected = argument or (Path(os.environ["CODEX_HOME"]) if os.environ.get("CODEX_HOME") else Path.home() / ".codex")
+    return selected.expanduser().resolve()
+
+
+def rollback(home: Path, apply: bool) -> int:
+    backup_dir = home / "instruction-backups"
+    state_file = backup_dir / "latest.json"
+    if not state_file.is_file():
+        print(f"No rollback record found at {state_file}", file=sys.stderr)
+        return 1
+    try:
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        if state.get("rolled_back"):
+            print("The latest install has already been rolled back.", file=sys.stderr)
+            return 1
+        target = home / "AGENTS.md"
+        if target.is_symlink():
+            print("Rollback stopped: AGENTS.md is a symlink; refusing to follow or replace it.", file=sys.stderr)
+            return 1
+        current = target.read_bytes()
+        if sha256(current) != state["installed_sha256"]:
+            print("Rollback stopped: AGENTS.md has changed since this install; preserving the unexpected edit.", file=sys.stderr)
+            return 1
+        if state["original_exists"]:
+            original = backup_dir / state["backup_name"]
+            prior = original.read_bytes()
+            if sha256(prior) != state["original_sha256"]:
+                print("Rollback stopped: the saved backup does not match its recorded hash.", file=sys.stderr)
+                return 1
+            action = f"restore {original} to {target}"
+        else:
+            action = f"remove installed file {target}"
+    except (OSError, KeyError, ValueError, json.JSONDecodeError) as error:
+        print(f"Cannot read rollback state: {error}", file=sys.stderr)
+        return 1
+
+    print(f"Rollback preview: {action}")
+    if not apply:
+        print("Preview only; pass --apply to perform the rollback.")
+        return 0
+    if state["original_exists"]:
+        atomic_write(target, prior, mode=target.stat().st_mode & 0o777)
+    else:
+        target.unlink()
+    state["rolled_back"] = True
+    state_file.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print("Rollback complete; saved backups were retained.")
+    return 0
+
+
+def install(home: Path, apply: bool, replace: bool) -> int:
+    content = build_content()
+    target = home / "AGENTS.md"
+    try:
+        if target.is_symlink():
+            print(f"Refusing to manage symlink {target}; choose a regular Codex home file.", file=sys.stderr)
+            return 1
+        existing = target.read_bytes() if target.exists() else None
+    except OSError as error:
+        print(f"Cannot read {target}: {error}", file=sys.stderr)
+        return 1
+
+    if existing == content:
+        print(f"No change: {target} already has the generated content.")
+        return 0
+    if existing is not None and not replace:
+        print(f"{target} already contains different content; preview will not replace it.", file=sys.stderr)
+        print("Pass --replace to explicitly allow replacement (a backup will be saved).", file=sys.stderr)
+        if not apply:
+            print(f"Preview: would install {len(content)} bytes to {target}")
+            return 0
+        return 2
+
+    print(f"Install preview: write {len(content)} bytes to {target}")
+    if existing is not None:
+        print("The existing file will be backed up before replacement.")
+    if not apply:
+        print("Preview only; pass --apply to write the file.")
+        return 0
+
+    home.mkdir(parents=True, exist_ok=True)
+    backup_dir = home / "instruction-backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    backup_name = f"AGENTS.md.{stamp}.bak" if existing is not None else None
+    if existing is not None and backup_name is not None:
+        atomic_write(backup_dir / backup_name, existing, mode=target.stat().st_mode & 0o777)
+    mode = target.stat().st_mode & 0o777 if target.exists() else 0o644
+    atomic_write(target, content, mode=mode)
+    state = {
+        "backup_name": backup_name,
+        "installed_sha256": sha256(content),
+        "original_exists": existing is not None,
+        "original_sha256": sha256(existing) if existing is not None else None,
+        "rolled_back": False,
+        "version": 1,
+    }
+    atomic_write(backup_dir / "latest.json", (json.dumps(state, indent=2, sort_keys=True) + "\n").encode(), mode=0o600)
+    print(f"Installed {target}")
+    if backup_name:
+        print(f"Backup: {backup_dir / backup_name}")
+    return 0
+
+
+def main() -> int:
+    args = parser().parse_args()
+    if args.rollback and args.replace:
+        parser().error("--replace cannot be combined with --rollback")
+    home = codex_home(args.codex_home)
+    if args.rollback:
+        return rollback(home, args.apply)
+    return install(home, args.apply, args.replace)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except OSError as error:
+        print(f"install: {error}", file=sys.stderr)
+        raise SystemExit(1)
